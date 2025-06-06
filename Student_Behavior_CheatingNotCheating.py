@@ -2,7 +2,6 @@ import cv2
 import time
 import csv
 from datetime import datetime
-from collections import deque
 from ultralytics import YOLO
 
 
@@ -20,23 +19,34 @@ class StudentBehaviorMonitor:
 
         self.prev_time = time.time()
 
-        self.cheating_counts = {}  # Track number of cheating detections per student
-        self.warning_counts = {}   # Track number of warnings issued per student
-        self.warning_threshold = 3  # Only warn at 3rd detection
+        self.student_id = 1
+        self.cheating_count = 0
+        self.warning_count = 0
+        self.warning_threshold = 3
 
+        # Cooldown mechanism
+        self.last_warning_time = 0
+        self.warning_cooldown = 10  # seconds
+
+        # Logging setup
         self.log_path = log_path
         self.csv_file = open(self.log_path, mode="w", newline="")
         self.writer = csv.writer(self.csv_file)
         self.writer.writerow(["Timestamp", "Student ID", "Detected Class", "Confidence",
                               "Behavior", "Action", "Warning Count"])
 
-        self.conf_threshold = 0.6
+        # Confidence threshold for cheating
+        self.conf_threshold = 0.75
 
     def process_frame(self, frame):
         frame_resized = cv2.resize(frame, (800, 800))
         results = self.model(frame_resized, stream=True)
 
-        student_id = 1
+        current_time = time.time()
+        detected_behavior = "Not Cheating"
+        action = "None"
+        label_color = (0, 255, 0)
+
         for result in results:
             boxes = result.boxes
             for box in boxes:
@@ -45,53 +55,47 @@ class StudentBehaviorMonitor:
                 class_name = self.model.names[cls_id].lower()
 
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
-                label_color = (0, 255, 0)
-                behavior_text = "Not Cheating"
-                action = "None"
-
-                # Initialize counters if first time
-                if student_id not in self.cheating_counts:
-                    self.cheating_counts[student_id] = 0
-                    self.warning_counts[student_id] = 0
 
                 if class_name == "cheating" and conf >= self.conf_threshold:
-                    self.cheating_counts[student_id] += 1
+                    self.cheating_count += 1
+                    detected_behavior = "Cheating"
 
-                    if self.cheating_counts[student_id] == self.warning_threshold:
-                        behavior_text = "Cheating"
-                        action = "Warning"
-                        label_color = (0, 0, 255)
-                        self.warning_counts[student_id] += 1
+                    # Warning logic with cooldown
+                    if self.cheating_count >= self.warning_threshold:
+                        if current_time - self.last_warning_time >= self.warning_cooldown:
+                            self.warning_count += 1
+                            self.last_warning_time = current_time
+                            action = "Warning"
+                            label_color = (0, 0, 255)
+                        else:
+                            action = "Already Warned"
+                            label_color = (0, 165, 255)
                     else:
-                        behavior_text = "Cheating"
-                        action = "None"
-                        label_color = (0, 165, 255)  # Orange for early detections
-                else:
-                    behavior_text = "Not Cheating"
-                    label_color = (0, 255, 0)
+                        action = "Monitor"
+                        label_color = (0, 165, 255)
 
-                # Draw on frame
-                label = f"Student {student_id}: {class_name} ({conf:.2f})"
+                # Draw rectangle and labels
+                label = f"Student {self.student_id}: {class_name} ({conf:.2f})"
                 cv2.rectangle(frame_resized, (x1, y1), (x2, y2), label_color, 2)
                 cv2.putText(frame_resized, label, (x1, y1 - 25),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, label_color, 2)
-                cv2.putText(frame_resized, f"Behavior: {behavior_text}", (x1, y1 - 5),
+                cv2.putText(frame_resized, f"Behavior: {detected_behavior}", (x1, y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, label_color, 2)
+                cv2.putText(frame_resized, f"Warnings: {self.warning_count}", (x1, y2 + 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, label_color, 2)
 
-                # Log data
+                # Log behavior to CSV
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self.writer.writerow([
                     timestamp,
-                    f"Student {student_id}",
+                    f"Student {self.student_id}",
                     class_name,
                     f"{conf:.2f}",
-                    behavior_text,
+                    detected_behavior,
                     action,
-                    self.warning_counts[student_id]
+                    self.warning_count
                 ])
                 self.csv_file.flush()
-
-                student_id += 1
 
         return frame_resized
 
@@ -105,11 +109,10 @@ class StudentBehaviorMonitor:
 
                 processed_frame = self.process_frame(frame)
 
-                # Display FPS
+                # FPS calculation
                 current_time = time.time()
                 fps = 1 / (current_time - self.prev_time)
                 self.prev_time = current_time
-
                 cv2.putText(processed_frame, f"FPS: {int(fps)}", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
@@ -127,6 +130,7 @@ class StudentBehaviorMonitor:
         cv2.destroyAllWindows()
         self.csv_file.close()
         print(f"Session ended. Log saved to '{self.log_path}'")
+        print(f"Student {self.student_id}: {self.warning_count} warnings, {self.cheating_count} cheating detections")
 
 
 if __name__ == "__main__":
