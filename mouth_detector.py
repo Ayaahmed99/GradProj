@@ -1,15 +1,24 @@
 import cv2
+import numpy as np
+from collections import deque
 import math
 import mediapipe as mp
-from collections import deque
-import numpy as np
-import csv
+import psycopg2
+from datetime import datetime
 import time
 
+#from main import YOLOv8FaceDetector  # Import the YOLOv8 face detector
+from main import YOLOv8FaceDetector
+from face_rec import FaceRecognition  # Import your face recognition class
 
-program_start_time = time.time()  # Program start timestamp in seconds
+# Database config (replace with your actual credentials)
+db_config = {
+    "host": "localhost",
+    "dbname": "face_recognition",
+    "user": "postgres",
+    "password": "root"
+}
 
-# MediaPipe Face Mesh initialization
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(
     static_image_mode=False,
@@ -19,82 +28,54 @@ face_mesh = mp_face_mesh.FaceMesh(
     min_tracking_confidence=0.5
 )
 
-# Mouth landmarks indices in MediaPipe Face Mesh
-TOP_LIP = 13
-BOTTOM_LIP = 14
-LEFT_MOUTH = 78
-RIGHT_MOUTH = 308
+TOP_LIP, BOTTOM_LIP = 13, 14
+LEFT_MOUTH, RIGHT_MOUTH = 78, 308
 CHIN = 152
 
-# Tracking data structures
-face_data = {}         # face_id : tracking info dict
-face_lost_counter = {} # face_id : lost frame count
+face_data = {}
+face_lost_counter = {}
 
-# Parameters
-MATCH_THRESHOLD = 50        # pixels, max distance to match faces
-LOST_FRAMES_THRESHOLD = 10  # frames to remove lost face
+MATCH_THRESHOLD = 50
+LOST_FRAMES_THRESHOLD = 10
 
+face_recognition = FaceRecognition()  # Initialize face recognition class
 
-# Utility functions
+# Track warnings per student id + course
+warning_counts = {}
+
+course_name = "Chemistry"  # or dynamic
+
 def euclidean_3d(pt1, pt2):
-    """Calculate 3D Euclidean distance between two landmarks."""
-    return math.sqrt((pt2.x - pt1.x) ** 2 + (pt2.y - pt1.y) ** 2 + (pt2.z - pt1.z) ** 2)
-
+    return math.sqrt((pt2.x - pt1.x) ** 2 + (pt2.y - pt1.y) ** 2 + (pt2.z - pt2.z) ** 2)
 
 def calculate_mouth_features(landmarks):
-    """Calculate normalized vertical and horizontal mouth openness relative to face height."""
-    top = landmarks[TOP_LIP]
-    bottom = landmarks[BOTTOM_LIP]
-    left = landmarks[LEFT_MOUTH]
-    right = landmarks[RIGHT_MOUTH]
-    chin = landmarks[CHIN]
-
-    vertical = euclidean_3d(top, bottom)
-    horizontal = euclidean_3d(left, right)
-    face_height = euclidean_3d(top, chin)
-
-    norm_vertical = vertical / face_height if face_height > 0 else 0
-    norm_horizontal = horizontal / face_height if face_height > 0 else 0
-
-    return norm_vertical, norm_horizontal
-
+    vertical = euclidean_3d(landmarks[TOP_LIP], landmarks[BOTTOM_LIP])
+    horizontal = euclidean_3d(landmarks[LEFT_MOUTH], landmarks[RIGHT_MOUTH])
+    face_height = euclidean_3d(landmarks[TOP_LIP], landmarks[CHIN])
+    return vertical / face_height if face_height > 0 else 0, horizontal / face_height if face_height > 0 else 0
 
 def update_ema(prev, current, alpha=0.3):
-    """Update exponential moving average."""
-    if prev is None:
-        return current
-    return alpha * current + (1 - alpha) * prev
-
+    return current if prev is None else alpha * current + (1 - alpha) * prev
 
 def update_openness_history(history, value, max_len=10):
-    """Append value to history deque and return its standard deviation."""
     history.append(value)
     if len(history) > max_len:
         history.popleft()
     return np.std(history)
 
-
 def get_face_center(landmarks, width, height):
-    """Calculate face center pixel coordinates from landmarks."""
     xs = [lm.x for lm in landmarks]
     ys = [lm.y for lm in landmarks]
-    center_x = int(np.mean(xs) * width)
-    center_y = int(np.mean(ys) * height)
-    return center_x, center_y
-
+    return int(np.mean(xs) * width), int(np.mean(ys) * height)
 
 def match_face(center, face_data):
-    """Match detected face center to existing tracked faces based on proximity."""
     for fid, data in face_data.items():
         prev_center = data['center']
-        dist = math.sqrt((center[0] - prev_center[0]) ** 2 + (center[1] - prev_center[1]) ** 2)
-        if dist < MATCH_THRESHOLD:
+        if math.sqrt((center[0] - prev_center[0]) ** 2 + (center[1] - prev_center[1]) ** 2) < MATCH_THRESHOLD:
             return fid
     return None
 
-
 def create_new_face(face_data, center):
-    """Create new face entry with unique ID."""
     new_id = max(face_data.keys()) + 1 if face_data else 0
     face_data[new_id] = {
         'center': center,
@@ -106,92 +87,122 @@ def create_new_face(face_data, center):
     }
     return new_id
 
+def log_student_behavior_to_db(student_id, student_name, course_name, status, warning_count, frame):
+    if student_id == "Unknown" or student_name == "Unknown":
+        return
+    try:
+        conn = psycopg2.connect(**db_config)
+        cursor = conn.cursor()
 
-def log_student_behavior(face_id, status, warning):
-    """Log student behavior to CSV with timestamp and warning suppression before 15 minutes."""
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    elapsed_time = time.time() - program_start_time
+        # Check if entry exists for student_id + course_name
+        cursor.execute("""
+            SELECT warnings FROM behaviour
+            WHERE student_id = %s AND course_name = %s
+            ORDER BY created_at DESC LIMIT 1
+        """, (student_id, course_name))
+        row = cursor.fetchone()
 
-    # Suppress warnings during first 15 minutes but still log status
-    if elapsed_time < 900 and warning:
-        warning = False
+        # Encode image frame
+        _, buffer = cv2.imencode('.jpg', frame)
+        image_bytes = buffer.tobytes()
+        created_at = datetime.now()
 
-    with open('student_behavior_log.csv', mode='a', newline='') as file:
-        writer = csv.writer(file)
-        writer.writerow([timestamp, face_id, status, warning])
+        if row:
+            # Existing record found, increment warning count
+            new_warning_count = row[0] + 1
+            cursor.execute("""
+                INSERT INTO behaviour (student_id, student_name, course_name, behaviour_type, warnings, captured_frame, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (student_id, student_name, course_name, status, new_warning_count, psycopg2.Binary(image_bytes), created_at))
+        else:
+            # No record found, insert new with warning_count=1
+            cursor.execute("""
+                INSERT INTO behaviour (student_id, student_name, course_name, behaviour_type, warnings, captured_frame, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (student_id, student_name, course_name, status, 1, psycopg2.Binary(image_bytes), created_at))
 
+        conn.commit()
+        cursor.close()
+        conn.close()
 
-def process_mouth(frame):
-    """Process frame, detect faces and mouth openness, update status, and visualize."""
+        # Update warning_counts dict for session tracking
+        warning_counts[(student_id, course_name)] = warning_counts.get((student_id, course_name), 0) + 1
+
+    except Exception as e:
+        print(f"DB Insert Error: {e}")
+
+def process_mouth(frame, box, recognized_faces):  # Now also accepts the bounding box
+    x1, y1, x2, y2 = box
     height, width, _ = frame.shape
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = face_mesh.process(rgb_frame)
-
     detected_face_ids = set()
+    student_name = "Unknown"
+    student_id = "Unknown"
 
     if results.multi_face_landmarks:
-        for face_landmarks in results.multi_face_landmarks:
-            landmarks = face_landmarks.landmark
+        face_landmarks = results.multi_face_landmarks[0]
+        landmarks = face_landmarks.landmark
+        center = get_face_center(landmarks, width, height)
 
-            center = get_face_center(landmarks, width, height)
-            matched_id = match_face(center, face_data)
-            if matched_id is None:
-                matched_id = create_new_face(face_data, center)
-            else:
-                face_data[matched_id]['center'] = center
+        matched_id = match_face(center, face_data)
+        if matched_id is None:
+            matched_id = create_new_face(face_data, center)
+        else:
+            face_data[matched_id]['center'] = center
+        detected_face_ids.add(matched_id)
 
-            detected_face_ids.add(matched_id)
+        # Find recognized student
+        for rid, rname, bbox in recognized_faces:
+                # The loop and box information is useless
+            student_id = rid
+            student_name = rname
+            break
 
-            norm_vertical, _ = calculate_mouth_features(landmarks)
-            prev_ema = face_data[matched_id]['openness_ema']
-            smoothed_openness = update_ema(prev_ema, norm_vertical)
-            face_data[matched_id]['openness_ema'] = smoothed_openness
+        norm_vertical, _ = calculate_mouth_features(landmarks)
+        smoothed_openness = update_ema(face_data[matched_id]['openness_ema'], norm_vertical)
+        face_data[matched_id]['openness_ema'] = smoothed_openness
 
-            std_dev = update_openness_history(face_data[matched_id]['openness_history'], smoothed_openness)
+        std_dev = update_openness_history(face_data[matched_id]['openness_history'], smoothed_openness)
 
-            # Thresholds for mouth status detection
-            TALKING_OPENNESS = 0.12
-            MOUTH_OPEN_THRESHOLD = 0.06
-            TALKING_STD_THRESHOLD = 0.007
+        TALKING_OPENNESS = 0.12
+        MOUTH_OPEN_THRESHOLD = 0.06
+        TALKING_STD_THRESHOLD = 0.007
 
-            if smoothed_openness > TALKING_OPENNESS and std_dev > TALKING_STD_THRESHOLD:
-                current_status = "Talking"
-                warning = True
-            elif smoothed_openness > MOUTH_OPEN_THRESHOLD:
-                current_status = "Mouth Open"
-                warning = False
-            else:
-                current_status = "Silent"
-                warning = False
+        if smoothed_openness > TALKING_OPENNESS and std_dev > TALKING_STD_THRESHOLD:
+            current_status, warning = "Talking", True
+        elif smoothed_openness > MOUTH_OPEN_THRESHOLD:
+            current_status, warning = "Mouth Open", False
+        else:
+            current_status, warning = "Silent", False
 
-            # Smooth status changes by requiring consistent frames
-            if current_status != face_data[matched_id]['status']:
-                face_data[matched_id]['frame_count'] += 1
-                if face_data[matched_id]['frame_count'] > 5:
-                    face_data[matched_id]['status'] = current_status
-                    face_data[matched_id]['warning'] = warning
-                    face_data[matched_id]['frame_count'] = 0
-
-                    log_student_behavior(matched_id + 1, current_status, warning)
-            else:
+        if current_status != face_data[matched_id]['status']:
+            face_data[matched_id]['frame_count'] += 1
+            if face_data[matched_id]['frame_count'] > 5:
+                face_data[matched_id]['status'] = current_status
+                face_data[matched_id]['warning'] = warning
                 face_data[matched_id]['frame_count'] = 0
 
-            # Visualization (optional)
-            color = (0, 255, 0) if face_data[matched_id]['status'] == "Talking" else \
-                    (0, 255, 255) if face_data[matched_id]['status'] == "Mouth Open" else (0, 0, 255)
+                if warning and student_id != "Unknown" and student_name != "Unknown":
+                    key = (student_id, course_name)
+                    warning_count = warning_counts.get(key, 0) + 1
+                    log_student_behavior_to_db(student_id, student_name, course_name, current_status, warning_count, frame)
+                    warning_counts[key] = warning_count
+        else:
+            face_data[matched_id]['frame_count'] = 0
 
-            cv2.putText(frame,
-                        f"Student {matched_id + 1}: {face_data[matched_id]['status']}",
-                        (center[0] - 60, center[1] - 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        color = (0, 255, 0) if current_status == "Talking" else (0, 255, 255) if current_status == "Mouth Open" else (0, 0, 255)
 
-            if face_data[matched_id]['warning']:
-                cv2.putText(frame,
-                            "WARNING: Talking Detected!",
-                            (center[0] - 80, center[1] - 60),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        # Draw rectangle and text
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        text = f"{student_name}: {current_status}"
+        cv2.putText(frame, text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-    # Remove lost faces after certain frames of disappearance
+        if warning:
+            cv2.putText(frame, "WARNING: Talking Detected!", (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+
+    # Cleanup lost faces
     for fid in list(face_data.keys()):
         if fid not in detected_face_ids:
             face_lost_counter[fid] = face_lost_counter.get(fid, 0) + 1
@@ -202,3 +213,44 @@ def process_mouth(frame):
             face_lost_counter[fid] = 0
 
     return frame
+
+
+if __name__ == '__main__':
+    model_path = "yolov8n-face.onnx"
+    conf_threshold = 0.45
+    iou_threshold = 0.5
+
+    face_detector = YOLOv8FaceDetector(model_path, conf_threshold, iou_threshold)
+
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: Could not open webcam.")
+        exit()
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Get face detections from YOLOv8
+        face_boxes = face_detector.get_face_boxes(frame)
+
+        # Process each detected face
+        for box in face_boxes:
+            x1, y1, x2, y2 = box
+            face_img = frame[y1:y2, x1:x2]  # Crop the face
+            recognized_faces = []
+            if face_img.size > 0:
+                name_data = face_recognition.get_names_for_faces(face_img)  # face_recognition on cropped face
+                for rid, rname, _ in name_data:
+                    recognized_faces.append((rid, rname, box))  #Keep original box
+
+            frame = process_mouth(frame, box, recognized_faces)  # Pass the original frame, the box and the identified face
+
+        cv2.imshow("YOLOv8 Face Detection - Webcam", frame)
+
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
